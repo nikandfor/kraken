@@ -158,20 +158,30 @@ type (
 	}
 
 	Trade struct {
+		ID string `json:"id"`
+
 		Pair      string  `json:"pair"`
 		Price     Decimal `json:"price"`
 		Volume    Decimal `json:"volume"`
 		Timestamp int64   `json:"time"`
 		Side      Side    `json:"side"` // buy/sell
-		Type      string  `json:"type"`
+		OrderType string  `json:"ordertype"`
+
+		Cost      Decimal `json:"cost,omitempty"`
+		Fee       Decimal `json:"fee,omitempty"`
+		Margin    Decimal `json:"margin,omitempty"`
+		OrderTxID string  `json:"ordertxid,omitempty"`
+		PosTxID   string  `json:"postxid,omitempty"`
 
 		Miscellaneous string `json:"miscellaneous,omitempty"`
 	}
 
 	Spread struct {
-		Time int64   `json:"time"`
-		Bid  Decimal `json:"bid"`
-		Ask  Decimal `json:"ask"`
+		Time      int64   `json:"time"`
+		Bid       Decimal `json:"bid"`
+		Ask       Decimal `json:"ask"`
+		BidVolume Decimal `json:"bid_volume"`
+		AskVolume Decimal `json:"ask_volume"`
 	}
 
 	TradeBalance struct {
@@ -187,15 +197,15 @@ type (
 	}
 
 	Order struct {
-		TxID   string `json:"txid,omitempty"`
-		Status string `json:"status,omitempty"`
-		Pair   string `json:"pair"`
-		Side   Side   `json:"side"` // buy/sell
-		Type   string `json:"type"` // market/limit
-		Price  string `json:"price"`
-		Volume string `json:"volume"`
+		TxID   string  `json:"txid,omitempty"`
+		Status string  `json:"status,omitempty"`
+		Pair   string  `json:"pair,omitempty"`
+		Side   Side    `json:"side,omitempty"` // buy/sell
+		Type   string  `json:"type,omitempty"` // market/limit
+		Price  Decimal `json:"price,omitempty"`
+		Volume Decimal `json:"volume,omitempty"`
 
-		Rest map[string]string `json:"rest"`
+		Rest map[string]interface{} `json:"rest"`
 	}
 )
 
@@ -263,6 +273,7 @@ func (c *Client) Assets() (r map[string]Asset, err error) {
 
 	for n, a := range r {
 		a.Name = n
+		r[n] = a
 	}
 
 	return r, nil
@@ -293,6 +304,7 @@ func (c *Client) AssetPairs(pairs []string, info string) (r map[string]AssetPair
 
 	for n, a := range r {
 		a.Name = n
+		r[n] = a
 	}
 
 	return r, nil
@@ -746,6 +758,82 @@ func (c *Candle) UnmarshalJSON(data []byte) (err error) {
 }
 
 func (t *Trade) UnmarshalJSON(data []byte) (err error) {
+	_, tp, _, err := jsonparser.Get(data)
+	if err != nil {
+		return errors.Wrap(err, "parse trade")
+	}
+
+	switch tp {
+	case jsonparser.Object:
+		return t.unmarshalJSONObj(data)
+	case jsonparser.Array:
+		return t.unmarshalJSONArr(data)
+	default:
+		return errors.New("unsupported format: %v", tp)
+	}
+}
+
+func (t *Trade) unmarshalJSONObj(data []byte) (err error) {
+	return jsonparser.ObjectEach(data, func(k, v []byte, tp jsonparser.ValueType, off int) (err error) {
+		err = jsonparser.ObjectEach(v, func(k, v []byte, tp jsonparser.ValueType, off int) (err error) {
+			defer func() {
+				err = errors.Wrap(err, "parse %s", k)
+			}()
+
+			switch string(k) {
+			case "cost":
+				return json.Unmarshal(v, &t.Cost)
+			case "fee":
+				return json.Unmarshal(v, &t.Fee)
+			case "margin":
+				return json.Unmarshal(v, &t.Margin)
+			case "ordertxid":
+				t.OrderTxID = string(v)
+				return nil
+			case "ordertype":
+				t.OrderType = string(v)
+				return nil
+			case "pair":
+				t.Pair = string(v)
+				return nil
+			case "postxid":
+				t.PosTxID = string(v)
+				return nil
+			case "price":
+				return json.Unmarshal(v, &t.Price)
+			case "volume", "vol":
+				return json.Unmarshal(v, &t.Volume)
+			case "time":
+				var d Decimal
+				err = d.UnmarshalJSON(v)
+				if err != nil {
+					return err
+				}
+
+				t.Timestamp = d.Mul(ns).IntPart()
+
+				return nil
+			case "type", "side":
+				switch string(v) {
+				case "b", "buy", "bid":
+					t.Side = Buy
+				case "s", "sell", "ask":
+					t.Side = Sell
+				}
+				return nil
+			default:
+				return errors.New("unexpected field")
+			}
+		})
+		err = errors.Wrap(err, "trade data")
+
+		t.ID = string(k)
+
+		return err
+	})
+}
+
+func (t *Trade) unmarshalJSONArr(data []byte) (err error) {
 	var q []interface{}
 
 	d := json.NewDecoder(bytes.NewReader(data))
@@ -786,7 +874,7 @@ func (t *Trade) UnmarshalJSON(data []byte) (err error) {
 		return errors.New("unexpected side: %v", q[3])
 	}
 
-	t.Type = q[4].(string)
+	t.OrderType = q[4].(string)
 
 	t.Miscellaneous = q[5].(string)
 
@@ -801,14 +889,23 @@ func (s *Spread) UnmarshalJSON(data []byte) (err error) {
 		return err
 	}
 
-	if len(q) != 3 {
-		return errors.New("unsupported spread format: expected 3 elements got %v", len(q))
-	}
-
-	*s = Spread{
-		Time: q[0].Mul(ns).IntPart(),
-		Bid:  q[1],
-		Ask:  q[2],
+	switch len(q) {
+	case 3:
+		*s = Spread{
+			Time: q[0].Mul(ns).IntPart(),
+			Bid:  q[1],
+			Ask:  q[2],
+		}
+	case 5:
+		*s = Spread{
+			Bid:       q[0],
+			Ask:       q[1],
+			Time:      q[2].Mul(ns).IntPart(),
+			BidVolume: q[3],
+			AskVolume: q[4],
+		}
+	default:
+		return errors.New("unsupported spread format: expected 3 or 5 elements got %v", len(q))
 	}
 
 	return nil
@@ -852,8 +949,8 @@ func (o *Order) UnmarshalJSON(data []byte) (err error) {
 			switch string(k) {
 			case "status":
 				o.Status = string(v)
-			case "vol":
-				o.Volume = string(v)
+			case "vol", "volume":
+				return o.Volume.UnmarshalJSON(v)
 			case "descr":
 				return jsonparser.ObjectEach(v, func(k, v []byte, tp jsonparser.ValueType, off int) error {
 					switch string(k) {
@@ -871,7 +968,7 @@ func (o *Order) UnmarshalJSON(data []byte) (err error) {
 					case "ordertype":
 						o.Type = string(v)
 					case "price":
-						o.Price = string(v)
+						return o.Price.UnmarshalJSON(v)
 					default:
 						o.Rest[string(k)] = string(v)
 					}
@@ -879,6 +976,10 @@ func (o *Order) UnmarshalJSON(data []byte) (err error) {
 					return nil
 				})
 			default:
+				if o.Rest == nil {
+					o.Rest = make(map[string]interface{})
+				}
+
 				o.Rest[string(k)] = string(v)
 			}
 
@@ -996,6 +1097,36 @@ func (b *TradeBalance) UnmarshalJSON(data []byte) (err error) {
 	return nil
 }
 
+func (s Side) MarshalJSON() ([]byte, error) {
+	if s == Buy {
+		return []byte(`"buy"`), nil
+	} else {
+		return []byte(`"sell"`), nil
+	}
+}
+
+func (s *Side) UnmarshalJSON(data []byte) (err error) {
+	v, tp, _, err := jsonparser.Get(data)
+	if err != nil {
+		return err
+	}
+
+	if tp != jsonparser.String {
+		return errors.New("side: expected string")
+	}
+
+	switch string(v) {
+	case "b", "buy":
+		*s = Buy
+	case "s", "sell":
+		*s = Sell
+	default:
+		return errors.New("side: expected buy or sell")
+	}
+
+	return nil
+}
+
 func qq(q string) string {
 	if q == "" {
 		return ""
@@ -1004,12 +1135,12 @@ func qq(q string) string {
 	return "?" + q
 }
 
-func (s Side) EncodeToString() string {
+func (s Side) String() string {
 	switch s {
 	case Buy:
-		return "b"
+		return "buy"
 	case Sell:
-		return "s"
+		return "sell"
 	}
 
 	return ""

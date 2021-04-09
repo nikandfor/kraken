@@ -3,7 +3,6 @@ package kraken
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"strings"
 	"sync"
 	"time"
@@ -12,6 +11,7 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/nikandfor/errors"
 	"github.com/nikandfor/tlog"
+	"github.com/shopspring/decimal"
 )
 
 type (
@@ -34,6 +34,11 @@ type (
 		version string
 
 		stopc chan struct{}
+	}
+
+	Option struct {
+		Name  string
+		Value interface{}
 	}
 
 	Event struct {
@@ -113,18 +118,18 @@ func newSubscribtion(c *websocket.Conn, token string) (s *Websocket) {
 func (s *Websocket) AddOrder(ctx context.Context, o Order) (txid string, err error) {
 	reqid := time.Now().UnixNano()
 
-	q := map[string]string{
+	q := map[string]interface{}{
 		"event": "addOrder",
 		"token": s.token,
-		"reqid": fmt.Sprintf("%v", reqid),
+		"reqid": reqid,
 
 		"ordertype": o.Type,
-		"type":      o.Side.EncodeToString(),
+		"type":      o.Side.String(),
 		"pair":      o.Pair,
 		"volume":    o.Volume,
 	}
 
-	if o.Price != "" {
+	if o.Price != decimal.Zero {
 		q["price"] = o.Price
 	}
 
@@ -142,6 +147,7 @@ func (s *Websocket) AddOrder(ctx context.Context, o Order) (txid string, err err
 	}
 
 	err = s.request(ctx, reqid, q, &res)
+	tlog.V("add_order").Printw("add order", "req", q, "res", res, "err", err)
 	if err != nil {
 		return "", err
 	}
@@ -163,7 +169,7 @@ func (s *Websocket) CancelOrder(ctx context.Context, txid ...string) (err error)
 	q := map[string]interface{}{
 		"event": "cancelOrder",
 		"token": s.token,
-		"reqid": fmt.Sprintf("%v", reqid),
+		"reqid": reqid,
 
 		"txid": txid,
 	}
@@ -187,23 +193,18 @@ func (s *Websocket) CancelOrder(ctx context.Context, txid ...string) (err error)
 	return nil
 }
 
-func (s *Websocket) Subscribe(ctx context.Context, topic string, pairs []string, args ...string) (err error) {
+func (s *Websocket) Subscribe(ctx context.Context, topic string, pairs []string, args ...Option) (err error) {
 	reqid := time.Now().UnixNano()
 
-	sc := map[string]string{
+	sc := map[string]interface{}{
 		"name": topic,
 	}
 	if s.token != "" {
 		sc["token"] = s.token
 	}
 
-	for _, a := range args {
-		p := strings.Index(a, "=")
-		if p == -1 {
-			sc[a] = ""
-		} else {
-			sc[a[:p]] = a[1+p:]
-		}
+	for _, o := range args {
+		sc[o.Name] = o.Value
 	}
 
 	e := map[string]interface{}{
@@ -225,9 +226,12 @@ func (s *Websocket) Subscribe(ctx context.Context, topic string, pairs []string,
 		Pair      string `json:"pair"`
 	}
 
-	err = s.requestMany(ctx, reqid, e, &res, len(pairs), func() error {
-		tlog.Printw("subscribed", "res", res)
+	n := len(pairs)
+	if n == 0 {
+		n = 1
+	}
 
+	err = s.requestMany(ctx, reqid, e, &res, n, func() error {
 		if res.Error != "" {
 			return errors.New(res.Error)
 		}
@@ -286,6 +290,7 @@ func (s *Websocket) requestMany(ctx context.Context, reqid int64, req, resp inte
 	for i := 0; i < n; i++ {
 		select {
 		case msg = <-resc:
+			//
 		case <-ctx.Done():
 			err = ctx.Err()
 		case <-s.stopc:
@@ -352,19 +357,13 @@ func (s *Websocket) reader() {
 }
 
 func (s *Websocket) decodeArr(msg []byte) (err error) {
-	v, tp, _, _ := jsonparser.Get(msg, "[2]")
-	if tp != jsonparser.String {
-		v, tp, _, _ = jsonparser.Get(msg, "[1]")
-	}
-	if tp != jsonparser.String {
-		jsonparser.ArrayEach(msg, func(v []byte, tp jsonparser.ValueType, off int, err error) {
-			tlog.Printw("arr el", "v", v, "tp", tp, "off", off, "err", err)
-		})
+	var chname string
 
-		return errors.New("not parsed")
-	}
-
-	chname := string(v)
+	jsonparser.ArrayEach(msg, func(v []byte, tp jsonparser.ValueType, off int, err error) {
+		if chname == "" && tp == jsonparser.String {
+			chname = string(v)
+		}
+	})
 
 	switch {
 	case chname == "trade":
@@ -373,6 +372,10 @@ func (s *Websocket) decodeArr(msg []byte) (err error) {
 		return s.decodeBook(msg)
 	case chname == "openOrders":
 		return s.decodeOrders(msg)
+	case chname == "ownTrades":
+		return s.decodeOwnTrades(msg)
+	case chname == "spread":
+		return s.decodeSpread(msg)
 	}
 
 	return errors.New("unsupported channel: %v", chname)
@@ -426,9 +429,59 @@ func (s *Websocket) decodeTrade(msg []byte) (err error) {
 }
 
 func (s *Websocket) decodeBook(msg []byte) (err error) {
-	el := -1
 	var r Depth
 	var chname string
+	var pair string
+
+	_, err = jsonparser.ArrayEach(msg, func(v []byte, tp jsonparser.ValueType, off int, err error) {
+		if err != nil {
+			return
+		}
+
+		switch {
+		case tp == jsonparser.Number:
+			// chid
+		case tp == jsonparser.Object:
+			// depth (could be multiple times)
+
+			var q Depth
+			err = json.Unmarshal(v, &q)
+
+			if r.Asks == nil {
+				r.Asks = q.Asks
+			}
+			if r.Bids == nil {
+				r.Bids = q.Bids
+			}
+		case tp == jsonparser.String && chname == "":
+			chname = string(v)
+		case tp == jsonparser.String && pair == "":
+			pair = string(v)
+		default:
+			tlog.Printw("unhandled depth event field", "value", v, "type", tp, "off", off)
+		}
+	})
+
+	if err != nil {
+		return
+	}
+
+	select {
+	case s.ch <- Event{
+		Channel: chname,
+		Pair:    pair,
+		Data:    r,
+	}:
+	case <-s.stopc:
+		return ErrStopped
+	}
+
+	return nil
+}
+
+func (s *Websocket) decodeSpread(msg []byte) (err error) {
+	el := -1
+	var d Spread
 	var pair string
 
 	_, err = jsonparser.ArrayEach(msg, func(v []byte, tp jsonparser.ValueType, off int, err error) {
@@ -442,11 +495,10 @@ func (s *Websocket) decodeBook(msg []byte) (err error) {
 		case 0:
 			// chid
 		case 1:
-			// trades
-			err = json.Unmarshal(v, &r)
+			// spread
+			err = json.Unmarshal(v, &d)
 		case 2:
 			// chname
-			chname = string(v)
 		case 3:
 			// pair
 			pair = string(v)
@@ -459,9 +511,9 @@ func (s *Websocket) decodeBook(msg []byte) (err error) {
 
 	select {
 	case s.ch <- Event{
-		Channel: chname,
+		Channel: "spread",
 		Pair:    pair,
-		Data:    r,
+		Data:    d,
 	}:
 	case <-s.stopc:
 		return ErrStopped
@@ -510,6 +562,52 @@ func (s *Websocket) decodeOrders(msg []byte) (err error) {
 	return nil
 }
 
+func (s *Websocket) decodeOwnTrades(msg []byte) (err error) {
+	el := -1
+	var chname string
+	var ts []Trade
+	var seq int64
+
+	_, e := jsonparser.ArrayEach(msg, func(v []byte, tp jsonparser.ValueType, off int, _ error) {
+		if err != nil {
+			return
+		}
+
+		el++
+
+		switch {
+		case ts == nil && tp == jsonparser.Array:
+			err = json.Unmarshal(v, &ts)
+			err = errors.Wrap(err, "trades list")
+		case chname == "" && tp == jsonparser.String:
+			chname = string(v)
+		case seq == 0 && tp == jsonparser.Object:
+			seq, err = jsonparser.GetInt(v, "sequence")
+		default:
+			err = errors.New("unsupported element [%d]: %v", el, tp)
+		}
+	})
+
+	if err == nil {
+		err = e
+	}
+
+	if err != nil {
+		return err
+	}
+
+	select {
+	case s.ch <- Event{
+		Channel: chname,
+		Data:    ts,
+	}:
+	case <-s.stopc:
+		return ErrStopped
+	}
+
+	return
+}
+
 func (s *Websocket) decodeObj(msg []byte) (err error) {
 	var event string
 
@@ -534,13 +632,30 @@ func (s *Websocket) decodeObj(msg []byte) (err error) {
 	}
 
 	v, tp, _, _ = jsonparser.Get(msg, "event")
-	if tp != jsonparser.String {
+	if tp == jsonparser.String {
 		event = string(v)
 	}
 
+	if !tlog.If("heartbeat") {
+		switch event {
+		case "heartbeat":
+			// drop
+			return nil
+		}
+	}
+
 	switch event {
-	case "heartbeat":
-		// drop
+	case "systemStatus":
+		var d SystemStatus
+		err = json.Unmarshal(msg, &d)
+		if err != nil {
+			return errors.Wrap(err, "decode system status")
+		}
+
+		select {
+		case s.sys <- d:
+		default:
+		}
 	default:
 		select {
 		case s.sys <- json.RawMessage(msg):
@@ -571,4 +686,8 @@ func (s *Websocket) waitReq(id int64, c chan []byte) func() {
 		delete(s.reqs, id)
 		s.mu.Unlock()
 	}
+}
+
+func WithOption(n string, v interface{}) Option {
+	return Option{Name: n, Value: v}
 }

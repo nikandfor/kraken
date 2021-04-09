@@ -10,6 +10,7 @@ import (
 	_ "net/http/pprof"
 	"os"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
@@ -18,6 +19,7 @@ import (
 	"github.com/nikandfor/kraken"
 	"github.com/nikandfor/tlog"
 	"github.com/nikandfor/tlog/ext/tlflag"
+	"github.com/shopspring/decimal"
 
 	krakenapi "github.com/beldur/kraken-go-api-client"
 )
@@ -125,6 +127,30 @@ func main() {
 			cli.NewFlag("debug", "", "debug addr to listen to"),
 		},
 		Commands: []*cli.Command{{
+			Name:   "order",
+			Before: beforeCall,
+			Commands: []*cli.Command{{
+				Name:   "submit",
+				Action: submit,
+				Flags: []*cli.Flag{
+					cli.NewFlag("market,pair", "", "market"),
+					cli.NewFlag("volume", "", ""),
+					cli.NewFlag("price", "", ""),
+					cli.NewFlag("type", "", ""),
+					cli.NewFlag("side", "", ""),
+					cli.NewFlag("wait", false, "wait for order to complete"),
+					cli.NewFlag("timeout", 5*time.Second, ""),
+				},
+			}, {
+				Name:   "cancel",
+				Action: cancel,
+				Args:   cli.Args{},
+				Flags: []*cli.Flag{
+					cli.NewFlag("wait", false, "wait for order to complete"),
+					cli.NewFlag("timeout", 5*time.Second, ""),
+				},
+			}},
+		}, {
 			Name:     "call",
 			Before:   beforeCall,
 			Commands: callcmds,
@@ -135,6 +161,7 @@ func main() {
 			Flags: []*cli.Flag{
 				cli.NewFlag("pair", "", "comma separated list of pairs to subscribe"),
 				cli.NewFlag("topic", "", "comma separated list of topics to subscribe"),
+				cli.NewFlag("args", "", "comma separated list of additional args"),
 				cli.NewFlag("private", false, "use private endpoint"),
 			},
 		}},
@@ -185,6 +212,119 @@ func beforeCall(c *cli.Command) (err error) {
 	cl, err = newClient(c)
 
 	return
+}
+
+func submit(c *cli.Command) (err error) {
+	var side kraken.Side
+	switch q := c.String("side"); q {
+	case "b", "buy":
+		side = kraken.Buy
+	case "s", "sell":
+		side = kraken.Sell
+	default:
+		return errors.New("bad order side: %v", q)
+	}
+
+	o := kraken.Order{
+		Pair:   c.String("pair"),
+		Side:   side,
+		Type:   c.String("type"),
+		Price:  decimal.RequireFromString(c.String("price")),
+		Volume: decimal.RequireFromString(c.String("volume")),
+	}
+
+	ctx := context.Background()
+	if d := c.Duration("timeout"); d != 0 {
+		var cancel func()
+		ctx, cancel = context.WithTimeout(ctx, d)
+		defer cancel()
+	}
+
+	ws, err := cl.PrivateWebsocket(ctx)
+	if err != nil {
+		return errors.Wrap(err, "connect to websocket")
+	}
+
+	if c.Bool("wait") {
+		err = ws.Subscribe(ctx, "openOrders", nil)
+		if err != nil {
+			return errors.Wrap(err, "subscribe to updates")
+		}
+	}
+
+	txid, err := ws.AddOrder(ctx, o)
+	if err != nil {
+		return errors.Wrap(err, "submit order")
+	}
+
+	err = out(c, txid)
+	if err != nil {
+		return err
+	}
+
+	if !c.Bool("wait") {
+		return nil
+	}
+
+	for {
+		select {
+		case ev := <-ws.C():
+			tlog.Printw("event", "event", ev)
+		case ev := <-ws.Sys():
+			tlog.Printw("system event", "event", ev)
+		case err = <-ws.Err():
+			return errors.Wrap(err, "websocket")
+		}
+	}
+
+	return nil
+}
+
+func cancel(c *cli.Command) (err error) {
+	if c.Args.Len() == 0 {
+		return errors.New("arguments expected")
+	}
+
+	ctx := context.Background()
+	if d := c.Duration("timeout"); d != 0 {
+		var cancel func()
+		ctx, cancel = context.WithTimeout(ctx, d)
+		defer cancel()
+	}
+
+	ws, err := cl.PrivateWebsocket(ctx)
+	if err != nil {
+		return errors.Wrap(err, "connect to websocket")
+	}
+
+	if c.Bool("wait") {
+		err = ws.Subscribe(ctx, "openOrders", nil)
+		if err != nil {
+			return errors.Wrap(err, "subscribe to updates")
+		}
+	}
+
+	err = ws.CancelOrder(ctx, c.Args...)
+	if err != nil {
+		return errors.Wrap(err, "cancel order")
+	}
+
+	if !c.Bool("wait") {
+		return nil
+	}
+
+	for {
+		select {
+		case ev := <-ws.C():
+			tlog.Printw("event", "event", ev)
+		case ev := <-ws.Sys():
+			tlog.Printw("system event", "event", ev)
+		case err = <-ws.Err():
+			return errors.Wrap(err, "websocket")
+		}
+	}
+
+	return nil
 }
 
 func serverTime(c *cli.Command) error {
@@ -360,7 +500,28 @@ func subscribe(c *cli.Command) (err error) {
 		return errors.Wrap(err, "connect")
 	}
 
-	err = ws.Subscribe(context.Background(), topic, pairs)
+	var args []kraken.Option
+	if q := c.String("args"); q != "" {
+
+		for _, p := range strings.Split(q, ",") {
+			kv := strings.SplitN(p, "=", 2)
+
+			if len(kv) == 1 {
+				args = append(args, kraken.WithOption(kv[0], "1"))
+				continue
+			}
+
+			v, err := strconv.ParseInt(kv[1], 10, 64)
+			if err == nil {
+				args = append(args, kraken.WithOption(kv[0], v))
+				continue
+			}
+
+			args = append(args, kraken.WithOption(kv[0], kv[1]))
+		}
+	}
+
+	err = ws.Subscribe(context.Background(), topic, pairs, args...)
 	if err != nil {
 		return errors.Wrap(err, "subscribe")
 	}
